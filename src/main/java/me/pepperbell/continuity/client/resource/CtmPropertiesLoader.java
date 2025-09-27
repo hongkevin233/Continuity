@@ -1,6 +1,7 @@
 package me.pepperbell.continuity.client.resource;
 
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -8,9 +9,14 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.Function;
-
 import org.jetbrains.annotations.NotNull;
-
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import net.minecraft.resource.ResourceManager;
+import net.minecraft.resource.ResourcePack;
+import net.minecraft.resource.ResourceType;
+import net.minecraft.resource.metadata.ResourcePackMetadata;
+import net.minecraft.util.Identifier;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
@@ -23,36 +29,66 @@ import me.pepperbell.continuity.client.ContinuityClient;
 import me.pepperbell.continuity.client.model.QuadProcessors;
 import me.pepperbell.continuity.client.util.BooleanState;
 import me.pepperbell.continuity.client.util.biome.BiomeHolderManager;
-import net.minecraft.client.texture.Sprite;
-import net.minecraft.client.util.SpriteIdentifier;
-import net.minecraft.resource.ResourceManager;
-import net.minecraft.resource.ResourcePack;
-import net.minecraft.resource.ResourceType;
-import net.minecraft.util.Identifier;
 
 public class CtmPropertiesLoader {
 	private final ResourceManager resourceManager;
 	private final List<LoadingContainer<?>> containers = new ObjectArrayList<>();
 	private final Map<Identifier, Set<Identifier>> textureDependencies = new Object2ObjectOpenHashMap<>();
+	// MTS专属配置：合法CTM路径集合、资源包标识
+	private static final String MTS_NAMESPACE = "mts";
+	private static final String MTS_PACK_METADATA_KEY = "mts";
+	private static final String MTS_VALID_CTM_KEY = "validCtmPaths";
+	private final Map<String, Set<String>> mtsPackValidCtmPaths = new Object2ObjectOpenHashMap<>(); // 包名→合法CTM路径
 
 	private CtmPropertiesLoader(ResourceManager resourceManager) {
 		this.resourceManager = resourceManager;
+		loadMtsValidCtmPaths(); // 初始化时加载MTS合法CTM路径
 	}
 
 	public static LoadingResult loadAllWithState(ResourceManager resourceManager) {
-		// TODO: move these to the very beginning of resource reload
 		BiomeHolderManager.clearCache();
-
 		LoadingResult result = loadAll(resourceManager);
-
-		// TODO: move these to the very end of resource reload
 		BiomeHolderManager.refreshHolders();
-
 		return result;
 	}
 
 	public static LoadingResult loadAll(ResourceManager resourceManager) {
 		return new CtmPropertiesLoader(resourceManager).loadAll();
+	}
+
+	// 加载每个MTS资源包的合法CTM路径（从pack.mcmeta解析）
+	private void loadMtsValidCtmPaths() {
+		for (ResourcePack pack : resourceManager.streamResourcePacks().toList()) {
+			try {
+				ResourcePackMetadata metadata = pack.getMetadata();
+				if (metadata != null && metadata.getRaw().has(MTS_PACK_METADATA_KEY)) {
+					JsonObject mtsMeta = metadata.getRaw().getAsJsonObject(MTS_PACK_METADATA_KEY);
+					if (mtsMeta.has(MTS_VALID_CTM_KEY)) {
+						Set<String> validCtmPaths = new ObjectOpenHashSet<>();
+						mtsMeta.getAsJsonArray(MTS_VALID_CTM_KEY).forEach(jsonElem -> {
+							String path = jsonElem.getAsString();
+							validCtmPaths.add(path);
+						});
+						// 按资源包名存储合法路径（避免跨包污染）
+						mtsPackValidCtmPaths.put(pack.getName(), validCtmPaths);
+					}
+				}
+			} catch (Exception e) {
+				ContinuityClient.LOGGER.warn("Failed to load MTS valid CTM paths for pack: {}", pack.getName(), e);
+			}
+		}
+	}
+
+	// 校验CTM资源是否为MTS合法路径（新增核心校验）
+	private boolean isMtsCtmValid(ResourcePack pack, Identifier resourceId) {
+		// 非MTS资源包直接放行
+		if (!mtsPackValidCtmPaths.containsKey(pack.getName())) {
+			return true;
+		}
+		// MTS资源包需校验路径是否在合法列表中
+		Set<String> validPaths = mtsPackValidCtmPaths.get(pack.getName());
+		return validPaths.contains(resourceId.getPath()) 
+				|| validPaths.contains(resourceId.toString());
 	}
 
 	private LoadingResult loadAll() {
@@ -68,44 +104,73 @@ public class CtmPropertiesLoader {
 		invalidIdentifierState.disable();
 
 		containers.sort(Comparator.reverseOrder());
-
 		return new LoadingResult(containers, textureDependencies);
 	}
 
 	private void loadAll(ResourcePack pack, int packPriority) {
 		for (String namespace : pack.getNamespaces(ResourceType.CLIENT_RESOURCES)) {
+			
+			if (!MTS_NAMESPACE.equals(namespace) && !"continuity".equals(namespace)) {
+				continue;
+			}
+
 			pack.findResources(ResourceType.CLIENT_RESOURCES, namespace, "optifine/ctm", (resourceId, inputSupplier) -> {
-				if (resourceId.getPath().endsWith(".properties")) {
-					try (InputStream stream = inputSupplier.get()) {
-						Properties properties = new Properties();
-						properties.load(stream);
-						load(properties, resourceId, pack, packPriority);
-					} catch (Exception e) {
-						ContinuityClient.LOGGER.error("Failed to load CTM properties from file '" + resourceId + "' in pack '" + pack.getName() + "'", e);
+				
+				if (!resourceId.getPath().endsWith(".properties")) {
+					return;
+				}
+
+				
+				if (!isMtsCtmValid(pack, resourceId)) {
+					ContinuityClient.LOGGER.debug("Skipping invalid MTS CTM: {} in pack: {}", resourceId, pack.getName());
+					return;
+				}
+
+				try (InputStream stream = inputSupplier.get()) {
+				
+					if (stream == null) {
+						ContinuityClient.LOGGER.warn("Null input stream for CTM: {} in pack: {}", resourceId, pack.getName());
+						return;
 					}
+
+					Properties properties = new Properties();
+					properties.load(stream);
+					load(properties, resourceId, pack, packPriority);
+				} catch (Exception e) {
+			
+					ContinuityClient.LOGGER.error("Failed to load CTM properties from '{}' in pack '{}'", resourceId, pack.getName(), e);
 				}
 			});
 		}
 	}
 
+	
 	private void load(Properties properties, Identifier resourceId, ResourcePack pack, int packPriority) {
 		String method = properties.getProperty("method", "ctm").trim();
 		CtmLoader<?> loader = CtmLoaderRegistry.get().getLoader(method);
 		if (loader != null) {
 			load(loader, properties, resourceId, pack, packPriority, method);
 		} else {
-			ContinuityClient.LOGGER.error("Unknown 'method' value '" + method + "' in file '" + resourceId + "' in pack '" + pack.getName() + "'");
+			ContinuityClient.LOGGER.error("Unknown 'method' '{}' in CTM '{}' (pack: {})", method, resourceId, pack.getName());
 		}
 	}
 
 	private <T extends CtmProperties> void load(CtmLoader<T> loader, Properties properties, Identifier resourceId, ResourcePack pack, int packPriority, String method) {
 		T ctmProperties = loader.getPropertiesFactory().createProperties(properties, resourceId, pack, packPriority, resourceManager, method);
 		if (ctmProperties != null) {
+			// Add: Verify whether the textures dependent on CTM are valid MTS resources
+			for (var spriteId : ctmProperties.getTextureDependencies()) {
+				if (!isMtsCtmValid(pack, spriteId.getTextureId())) {
+					ContinuityClient.LOGGER.warn("CTM '{}' (pack: {}) depends on invalid MTS texture: {}", resourceId, pack.getName(), spriteId.getTextureId());
+					return; // Skipping CTM loading due to illegal texture dependencies
+				}
+			}
+
 			LoadingContainer<T> container = new LoadingContainer<>(loader, ctmProperties);
 			containers.add(container);
-			for (SpriteIdentifier spriteId : ctmProperties.getTextureDependencies()) {
-				Set<Identifier> atlasTextureDependencies = textureDependencies.computeIfAbsent(spriteId.getAtlasId(), id -> new ObjectOpenHashSet<>());
-				atlasTextureDependencies.add(spriteId.getTextureId());
+			for (var spriteId : ctmProperties.getTextureDependencies()) {
+				Set<Identifier> atlasDependencies = textureDependencies.computeIfAbsent(spriteId.getAtlasId(), id -> new ObjectOpenHashSet<>());
+				atlasDependencies.add(spriteId.getTextureId());
 			}
 		}
 	}
@@ -122,7 +187,6 @@ public class CtmPropertiesLoader {
 			return properties.compareTo(o.properties);
 		}
 	}
-
 	public static class LoadingResult {
 		private final List<LoadingContainer<?>> containers;
 		private final Map<Identifier, Set<Identifier>> textureDependencies;
@@ -133,11 +197,11 @@ public class CtmPropertiesLoader {
 		}
 
 		public List<QuadProcessors.ProcessorHolder> createProcessorHolders(Function<SpriteIdentifier, Sprite> textureGetter) {
-			List<QuadProcessors.ProcessorHolder> processorHolders = new ObjectArrayList<>();
-			for (LoadingContainer<?> container : containers) {
-				processorHolders.add(container.toProcessorHolder(textureGetter));
+			List<QuadProcessors.ProcessorHolder> holders = new ObjectArrayList<>();
+			for (var container : containers) {
+				holders.add(container.toProcessorHolder(textureGetter));
 			}
-			return processorHolders;
+			return holders;
 		}
 
 		public Map<Identifier, Set<Identifier>> getTextureDependencies() {
